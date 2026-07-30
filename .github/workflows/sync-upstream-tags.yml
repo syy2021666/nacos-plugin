@@ -1,0 +1,34 @@
+name: Sync Upstream Tags
+
+# 定时 + 手动触发
+on:
+  schedule:
+    - cron: '0 2 * * *'        # 每天凌晨2点 (UTC) 运行一次
+  workflow_dispatch:             # 也可以在 Actions 页面手动触发
+
+permissions:
+  contents: write                # 需要写权限才能推送 tag
+
+jobs:
+  sync-tags:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 拉取完整 git 历史（需要用来同步 tag）
+          fetch-tags: true        # 拉取所有 tag
+
+      - name: Sync tags from upstream
+        run: |
+          # 添加上游仓库为远程仓库
+          git remote add upstream https://github.com/nacos-group/nacos-plugin
+
+          # 从上游拉取所有 tag
+          git fetch upstream --tags
+
+          # 推送到 origin（你的 fork）
+          # 只推送 tag，不动分支代码
+          git push origin --tags
+
+          echo "Tags synced successfully."
