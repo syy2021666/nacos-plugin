@@ -1,0 +1,179 @@
+name: Release Datasource Plugins
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.x*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag 名称 (如 2.5.x.1)'
+        required: true
+      nacos_version:
+        description: 'Nacos 版本 (如 2.5.2, 留空使用POM范围)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Parse versions
+        id: versions
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+          # 从 POM 读取 alibaba-nacos.version
+          NACOS_VER=$(grep '<alibaba-nacos.version>' pom.xml | sed 's/.*<alibaba-nacos.version>\(.*\)<\/alibaba-nacos.version>.*/\1/' | xargs)
+
+          # workflow_dispatch 可以手动指定版本
+          if [ -n "${{ github.event.inputs.nacos_version }}" ]; then
+            NACOS_VER="${{ github.event.inputs.nacos_version }}"
+          fi
+
+          echo "nacos_version=${NACOS_VER}" >> $GITHUB_OUTPUT
+          echo "Tag: ${TAG}, Nacos version: ${NACOS_VER}"
+
+      - name: Build all datasource plugins
+        run: |
+          # 读取 POM 中声明的所有数据源插件模块
+          MODULES=$(grep '<module>' nacos-datasource-plugin-ext/pom.xml | \
+            sed 's/.*<module>\(.*\)<\/module>.*/\1/' | \
+            grep -v base | \
+            sed 's|^|nacos-datasource-plugin-ext/|' | \
+            tr '\n' ',' | sed 's/,$//')
+
+          echo "Modules: ${MODULES}"
+
+          mvn -B -pl "${MODULES}" -am package -DskipTests \
+            -Dalibaba-nacos.version="${{ steps.versions.outputs.nacos_version }}"
+
+      - name: Resolve actual nacos version
+        id: resolve
+        run: |
+          RAW="${{ steps.versions.outputs.nacos_version }}"
+          # 如果是版本范围 [2.5.0,2.6)，解析为实际版本
+          if echo "${RAW}" | grep -q '^\['; then
+            RESOLVED=$(mvn help:evaluate -Dexpression=alibaba-nacos.version -q -DforceStdout 2>/dev/null || echo "${RAW}")
+          else
+            RESOLVED="${RAW}"
+          fi
+          # 清理范围语法残留
+          RESOLVED=$(echo "${RESOLVED}" | tr -d '[]()')
+          echo "resolved=${RESOLVED}" >> $GITHUB_OUTPUT
+          echo "Resolved nacos version: ${RESOLVED}"
+
+      - name: Collect and rename artifacts
+        id: collect
+        run: |
+          NACOS_VER="${{ steps.resolve.outputs.resolved }}"
+
+          rm -rf release-bundle
+          mkdir -p release-bundle/plugins release-bundle/conf
+
+          # 数据库 → schema 文件名映射
+          declare -A SCHEMA_MAP=(
+            ["dm"]="nacos-dm.sql"
+            ["kingbase"]="nacos-kingbase.sql"
+            ["opengauss"]="nacos-openguass-compatible-oracle.sql"
+            ["oracle"]="nacos-oracle.sql"
+            ["mssql"]="nacos-mssql.sql"
+            ["xuguDB"]="nacos-xugu.sql"
+            ["yasdb"]="nacos-yasdb.sql"
+          )
+
+          PLUGIN_LIST=""
+
+          for mod in dm kingbase opengauss oracle mssql xuguDB yasdb oceanbase postgresql; do
+            MOD_DIR="nacos-datasource-plugin-ext/nacos-${mod}-datasource-plugin-ext"
+            [ ! -d "${MOD_DIR}" ] && continue
+
+            # 复制 JAR → 统一版本号命名
+            JAR=$(ls ${MOD_DIR}/target/nacos-${mod}-datasource-plugin-ext-*.jar 2>/dev/null | \
+              grep -v sources | grep -v javadoc | head -1)
+            if [ -n "${JAR}" ]; then
+              NEW_NAME="nacos-${mod}-datasource-plugin-ext-${NACOS_VER}.jar"
+              cp "${JAR}" "release-bundle/plugins/${NEW_NAME}"
+              echo "JAR: ${NEW_NAME}"
+              PLUGIN_LIST="${PLUGIN_LIST}  - ${NEW_NAME}"$'\n'
+            fi
+
+            # 复制 Schema SQL
+            SQL="${SCHEMA_MAP[$mod]}"
+            if [ -n "${SQL}" ]; then
+              SRC="${MOD_DIR}/src/main/resources/schema/${SQL}"
+              if [ -f "${SRC}" ]; then
+                cp "${SRC}" "release-bundle/conf/${SQL}"
+                echo "SQL: ${SQL}"
+              fi
+            fi
+          done
+
+          echo "plugin_list<<EOF" >> $GITHUB_OUTPUT
+          echo "${PLUGIN_LIST}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=== Release Bundle Contents ==="
+          find release-bundle -type f | sort
+
+      - name: Create archive
+        id: archive
+        run: |
+          cd release-bundle
+          # 用 tag 中的版本号命名，避免范围表达式出现在文件名中
+          TAG="${{ steps.versions.outputs.tag }}"
+          ARCHIVE="nacos-datasource-plugins-${TAG}.tar.gz"
+          tar -czf "../${ARCHIVE}" .
+          echo "archive=${ARCHIVE}" >> $GITHUB_OUTPUT
+          echo "Archive: ${ARCHIVE} ($(du -h ../${ARCHIVE} | cut -f1))"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.versions.outputs.tag }}
+          name: "Nacos ${{ steps.versions.outputs.nacos_version }} Datasource Plugins"
+          body: |
+            ## Nacos ${{ steps.versions.outputs.nacos_version }} 国产数据库插件
+
+            基于 [${{ steps.versions.outputs.tag }}](../../tree/${{ steps.versions.outputs.tag }}) 构建。
+
+            ### 包含插件
+            ${{ steps.collect.outputs.plugin_list }}
+            ### 使用方法
+
+            1. 下载 `nacos-datasource-plugins-${{ steps.versions.outputs.nacos_version }}.tar.gz`
+            2. 解压到 Nacos 安装目录:
+               ```bash
+               tar -xzf nacos-datasource-plugins-${{ steps.versions.outputs.nacos_version }}.tar.gz -C /path/to/nacos/
+               ```
+            3. 执行 `conf/` 下对应数据库的 schema SQL 初始化数据库
+            4. 修改 `conf/application.properties`:
+               ```properties
+               nacos.plugin.datasource-dialect.type=dm
+               nacos.plugin.datasource.db.url.0=jdbc:dm://127.0.0.1:5236/nacos
+               nacos.plugin.datasource.db.user=nacos
+               nacos.plugin.datasource.db.password=nacos
+               ```
+            5. 重启 Nacos
+          files: |
+            ${{ steps.archive.outputs.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

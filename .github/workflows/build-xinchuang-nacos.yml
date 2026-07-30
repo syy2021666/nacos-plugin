@@ -1,0 +1,262 @@
+name: Build Nacos Xinchuang Distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      nacos_version:
+        description: 'Nacos 版本 (留空则从源码构建)'
+        required: false
+        default: ''
+      databases:
+        description: '数据库 (逗号分隔, 默认 all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - dm,kingbase,opengauss,xugu,yasdb,oceanbase,mssql,oracle
+          - dm
+          - dm,kingbase
+          - dm,kingbase,opengauss
+      plugin_version_override:
+        description: '插件版本覆盖 (留空使用默认)'
+        required: false
+        default: ''
+      upload_artifact:
+        description: '是否上传构建产物'
+        required: false
+        default: true
+        type: boolean
+
+  # 可通过其他仓库的 repository_dispatch 触发
+  repository_dispatch:
+    types: [nacos-release, plugin-release, build-xinchuang]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout nacos-plugin
+        uses: actions/checkout@v4
+        with:
+          path: nacos-plugin
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Determine nacos version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.nacos_version }}" ]; then
+            echo "NACOS_VERSION=${{ github.event.inputs.nacos_version }}" >> $GITHUB_OUTPUT
+            echo "USE_RELEASE=true" >> $GITHUB_OUTPUT
+          else
+            echo "NACOS_VERSION=" >> $GITHUB_OUTPUT
+            echo "USE_RELEASE=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -n "${{ github.event.inputs.plugin_version_override }}" ]; then
+            echo "PLUGIN_VERSION=${{ github.event.inputs.plugin_version_override }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download nacos release (if version specified)
+        if: steps.version.outputs.USE_RELEASE == 'true'
+        run: |
+          NACOS_VER="${{ steps.version.outputs.NACOS_VERSION }}"
+          echo "Downloading nacos-server-${NACOS_VER}.tar.gz..."
+          wget -q "https://github.com/alibaba/nacos/releases/download/${NACOS_VER}/nacos-server-${NACOS_VER}.tar.gz" \
+            -O /tmp/nacos-server.tar.gz
+          mkdir -p /tmp/nacos-dist
+          tar -xzf /tmp/nacos-server.tar.gz -C /tmp/nacos-dist --strip-components=1
+          echo "Nacos distribution extracted to /tmp/nacos-dist"
+          ls -la /tmp/nacos-dist/
+
+      - name: Checkout nacos source (if no release version)
+        if: steps.version.outputs.USE_RELEASE != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: alibaba/nacos
+          ref: develop
+          path: nacos
+
+      - name: Build nacos from source
+        if: steps.version.outputs.USE_RELEASE != 'true'
+        run: |
+          cd nacos
+          mvn -B -Prelease-nacos,!dev clean install -DskipTests \
+            -Drat.skip=true -Dspotbugs.skip=true -Dcheckstyle.skip=true -q
+          NACOS_VER=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "NACOS_VERSION=${NACOS_VER}" >> $GITHUB_OUTPUT
+          echo "Nacos built: ${NACOS_VER}"
+          # 指向构建好的发行版目录
+          NACOS_DIST="distribution/target/nacos-server-${NACOS_VER}"
+          echo "NACOS_DIST_DIR=${GITHUB_WORKSPACE}/nacos/${NACOS_DIST}" >> $GITHUB_ENV
+
+      - name: Build nacos-plugin (domestic DB modules)
+        run: |
+          cd nacos-plugin
+
+          NACOS_VER="${{ steps.version.outputs.NACOS_VERSION }}"
+          MVN_EXTRA=""
+          if [ -n "${NACOS_VER}" ]; then
+            MVN_EXTRA="-Dalibaba-nacos.version=${NACOS_VER}"
+          fi
+
+          # 构建所有数据源插件模块
+          mvn -B -pl nacos-datasource-plugin-ext -am clean package -DskipTests ${MVN_EXTRA} -q
+
+          echo "Plugin build complete. Generated JARs:"
+          find nacos-datasource-plugin-ext -name "*.jar" -not -name "*sources*" -not -name "*javadoc*" -not -name "original*" | sort
+
+      - name: Copy plugin JARs to nacos distribution
+        run: |
+          if [ "${{ steps.version.outputs.USE_RELEASE }}" = "true" ]; then
+            NACOS_DIST_DIR="/tmp/nacos-dist"
+          else
+            NACOS_DIST_DIR="${NACOS_DIST_DIR}"
+          fi
+
+          echo "Target distribution: ${NACOS_DIST_DIR}"
+          mkdir -p "${NACOS_DIST_DIR}/plugins"
+
+          # 所有国产数据库插件模块
+          MODULES="dm kingbase opengauss xuguDB yasdb oceanbase mssql oracle"
+
+          for mod in ${MODULES}; do
+            PLUGIN_DIR="nacos-plugin/nacos-datasource-plugin-ext/nacos-${mod}-datasource-plugin-ext/target"
+            if [ -d "${PLUGIN_DIR}" ]; then
+              JAR=$(ls "${PLUGIN_DIR}"/nacos-${mod}-datasource-plugin-ext-*.jar 2>/dev/null | grep -v sources | grep -v javadoc | head -1)
+              if [ -n "${JAR}" ]; then
+                cp -v "${JAR}" "${NACOS_DIST_DIR}/plugins/"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "=== 已复制的插件 ==="
+          ls -la "${NACOS_DIST_DIR}/plugins/" | grep "nacos-" || echo "(none)"
+
+      - name: Copy schema SQL to nacos distribution
+        run: |
+          if [ "${{ steps.version.outputs.USE_RELEASE }}" = "true" ]; then
+            NACOS_DIST_DIR="/tmp/nacos-dist"
+          else
+            NACOS_DIST_DIR="${NACOS_DIST_DIR}"
+          fi
+
+          mkdir -p "${NACOS_DIST_DIR}/conf"
+
+          # Schema 映射: 模块目录名 -> schema文件名
+          declare -A SCHEMAS=(
+            ["dm"]="nacos-dm.sql"
+            ["kingbase"]="nacos-kingbase.sql"
+            ["opengauss"]="nacos-openguass-compatible-oracle.sql"
+            ["xuguDB"]="nacos-xugu.sql"
+            ["yasdb"]="nacos-yasdb.sql"
+            ["mssql"]="nacos-mssql.sql"
+            ["oracle"]="nacos-oracle.sql"
+          )
+
+          for mod in "${!SCHEMAS[@]}"; do
+            SQL_FILE="${SCHEMAS[$mod]}"
+            SRC="nacos-plugin/nacos-datasource-plugin-ext/nacos-${mod}-datasource-plugin-ext/src/main/resources/schema/${SQL_FILE}"
+            if [ -f "${SRC}" ]; then
+              cp -v "${SRC}" "${NACOS_DIST_DIR}/conf/"
+            fi
+          done
+
+          echo ""
+          echo "=== 已复制的 Schema ==="
+          ls -la "${NACOS_DIST_DIR}/conf/" | grep "nacos-" || echo "(none)"
+
+      - name: Update application.properties with domestic DB docs
+        run: |
+          if [ "${{ steps.version.outputs.USE_RELEASE }}" = "true" ]; then
+            NACOS_DIST_DIR="/tmp/nacos-dist"
+          else
+            NACOS_DIST_DIR="${NACOS_DIST_DIR}"
+          fi
+
+          cat >> "${NACOS_DIST_DIR}/conf/application.properties" << 'EOF'
+
+          #--------------- 国产数据库配置 ---------------#
+          ## 达梦 DM
+          #nacos.plugin.datasource-dialect.type=dm
+          #nacos.plugin.datasource.db.url.0=jdbc:dm://127.0.0.1:5236/nacos
+          ## 人大金仓 KingbaseES
+          #nacos.plugin.datasource-dialect.type=kingbase
+          #nacos.plugin.datasource.db.url.0=jdbc:kingbase8://127.0.0.1:54321/nacos
+          ## OpenGauss
+          #nacos.plugin.datasource-dialect.type=gaussdb
+          #nacos.plugin.datasource.db.url.0=jdbc:opengauss://127.0.0.1:5432/nacos
+          ## 虚谷 XuguDB
+          #nacos.plugin.datasource-dialect.type=xugu
+          #nacos.plugin.datasource.db.url.0=jdbc:xugu://127.0.0.1:5138/nacos
+          ## 崖山 YasDB
+          #nacos.plugin.datasource-dialect.type=yasdb
+          #nacos.plugin.datasource.db.url.0=jdbc:yasdb://127.0.0.1:1688/nacos
+          ## 蚂蚁 OceanBase
+          #nacos.plugin.datasource-dialect.type=oceanbase
+          #nacos.plugin.datasource.db.url.0=jdbc:oceanbase://127.0.0.1:2881/nacos
+          ## SQL Server
+          #nacos.plugin.datasource-dialect.type=sqlserver
+          #nacos.plugin.datasource.db.url.0=jdbc:sqlserver://127.0.0.1:1433;database=nacos
+          EOF
+
+      - name: Create distribution archive
+        run: |
+          if [ "${{ steps.version.outputs.USE_RELEASE }}" = "true" ]; then
+            NACOS_DIST_DIR="/tmp/nacos-dist"
+          else
+            NACOS_DIST_DIR="${NACOS_DIST_DIR}"
+          fi
+
+          NACOS_VER="${{ steps.version.outputs.NACOS_VERSION }}"
+          if [ -z "${NACOS_VER}" ]; then
+            NACOS_VER=$(cd nacos && mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          fi
+
+          DIST_NAME="nacos-xinchuang-${NACOS_VER}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          ARCHIVE_NAME="nacos-xinchuang-${NACOS_VER}-${TIMESTAMP}.tar.gz"
+
+          cd "$(dirname "${NACOS_DIST_DIR}")"
+          mv "$(basename "${NACOS_DIST_DIR}")" "${DIST_NAME}"
+          tar -czf "${ARCHIVE_NAME}" "${DIST_NAME}"
+
+          echo "Archive: $(pwd)/${ARCHIVE_NAME}"
+          echo "ARCHIVE_PATH=$(pwd)/${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "DIST_NAME=${DIST_NAME}" >> $GITHUB_ENV
+
+          # 显示内容
+          echo ""
+          echo "=== 发行版内容 ==="
+          tar -tzf "${ARCHIVE_NAME}" | head -50
+
+      - name: Upload artifact
+        if: github.event.inputs.upload_artifact != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DIST_NAME }}
+          path: ${{ env.ARCHIVE_PATH }}
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## Nacos 信创版构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **发行版**: \`${{ env.DIST_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Nacos 版本**: ${{ steps.version.outputs.NACOS_VERSION || 'latest source' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **包含数据库插件**: dm, kingbase, opengauss, xugu, yasdb, oceanbase, mssql, oracle" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 使用方法" >> $GITHUB_STEP_SUMMARY
+          echo '```properties' >> $GITHUB_STEP_SUMMARY
+          echo '# conf/application.properties' >> $GITHUB_STEP_SUMMARY
+          echo 'nacos.plugin.datasource-dialect.type=dm' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
